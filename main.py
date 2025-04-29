@@ -1,12 +1,12 @@
-from PIL import Image
-import cv2 
+# Eliminar la importación no utilizada de PIL
+import cv2
 import numpy as np
 import time
 
-v1 = './videos/traffic_1.mp4'
-v2 = './videos/traffic_2.mp4'
-cascade_source = './cars.xml'
-car_cascade = cv2.CascadeClassifier(cascade_source)
+# --- Constantes ---
+V1_PATH = './videos/traffic_3.mp4'
+V2_PATH = './videos/traffic_2.mp4'
+CASCADE_SOURCE = './cars.xml'
 
 # Parámetros del semáforo
 AMBER_TIME = 2.0       # segundos fijos en ámbar
@@ -14,183 +14,212 @@ MIN_GREEN_TIME = 3.0   # mínimo tiempo en verde por ciclo (segundos)
 MAX_GREEN_TIME = 10.0  # máximo tiempo en verde por ciclo (segundos)
 EPS = 1e-6             # pequeño valor para evitar división por cero
 
+# Parámetros de procesamiento y visualización
+SMOOTHING_FACTOR = 0.3 # Factor para suavizado exponencial del conteo
+ESC_KEY = 27           # Código de la tecla ESC para salir
+DEFAULT_FRAME_WIDTH = 640
+DEFAULT_FRAME_HEIGHT = 480
+
+# Estados y colores para los semáforos
+STATES = ["VERDE", "AMBAR", "ROJO"]
+COLORS = {
+    "VERDE": (0, 255, 0),   # BGR - Verde
+    "AMBAR": (0, 255, 255), # BGR - Amarillo
+    "ROJO": (0, 0, 255)     # BGR - Rojo
+}
+
+# Cargar clasificador Haar Cascade
+car_cascade = cv2.CascadeClassifier(CASCADE_SOURCE)
+if car_cascade.empty():
+    print(f"Error: No se pudo cargar el clasificador Haar desde {CASCADE_SOURCE}")
+    exit()
+
 def process_frame(frame):
+    """Preprocesa un frame y detecta coches."""
     gray   = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blur   = cv2.GaussianBlur(gray, (5, 5), 0)
-    dil    = cv2.dilate(blur, np.ones((3,3)), iterations=1)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
-    final  = cv2.morphologyEx(dil, cv2.MORPH_CLOSE, kernel)
-    cars   = car_cascade.detectMultiScale(final, 1.1, 1)
+    # Las operaciones morfológicas pueden necesitar ajustes según el video
+    # dil    = cv2.dilate(blur, np.ones((3,3)), iterations=1)
+    # kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+    # final  = cv2.morphologyEx(dil, cv2.MORPH_CLOSE, kernel)
+    # Usar directamente el blur puede ser suficiente y más rápido
+    cars   = car_cascade.detectMultiScale(blur, 1.1, 2) # Ajustar parámetros si es necesario
     for (x, y, w, h) in cars:
         cv2.rectangle(frame, (x, y), (x+w, y+h), (0,0,255), 2)
     return frame, len(cars)
 
-def detect_two_videos(path1, path2):
-    # Estados y colores para los semáforos
-    STATES = ["VERDE", "AMBAR", "ROJO"]
-    COLORS = {
-        "VERDE": (0, 255, 0),   # BGR - Verde
-        "AMBAR": (0, 255, 255), # BGR - Amarillo
-        "ROJO": (0, 0, 255)     # BGR - Rojo
-    }
+def update_semaphore_state(current_time, semaforo, other_semaforo, count_hist, other_count_hist):
+    """Actualiza el estado de un semáforo basado en el tiempo y el tráfico."""
+    estado_actual = semaforo["estado"]
+    tiempo_inicio = semaforo["inicio"]
+    duracion_verde_actual = semaforo["duracion_verde"]
     
-    # Abrir capturas de video
+    if estado_actual == "VERDE" and current_time - tiempo_inicio > duracion_verde_actual:
+        semaforo["estado"] = "AMBAR"
+        semaforo["inicio"] = current_time
+    elif estado_actual == "AMBAR" and current_time - tiempo_inicio > AMBER_TIME:
+        semaforo["estado"] = "ROJO"
+        semaforo["inicio"] = current_time
+    elif estado_actual == "ROJO" and current_time - tiempo_inicio > other_semaforo["duracion_verde"] + AMBER_TIME:
+        semaforo["estado"] = "VERDE"
+        semaforo["inicio"] = current_time
+        # Recalcular duración verde basado en tráfico histórico
+        total_count = count_hist + other_count_hist + EPS
+        proportion = count_hist / total_count
+        semaforo["duracion_verde"] = MIN_GREEN_TIME + (MAX_GREEN_TIME - MIN_GREEN_TIME) * proportion
+        # Asegurar que la duración esté dentro de los límites
+        semaforo["duracion_verde"] = max(MIN_GREEN_TIME, min(MAX_GREEN_TIME, semaforo["duracion_verde"]))
+
+def get_frame(cap, last_frame, is_green, default_shape):
+    """Obtiene un frame del video o usa el último frame si no está en verde."""
+    frame = None
+    read_success = False
+    if is_green:
+        ret, frame = cap.read()
+        if ret:
+            read_success = True
+        else:
+            # Fin del video o error de lectura, usar último frame si existe
+            if last_frame is not None:
+                frame = last_frame.copy()
+            else:
+                # No hay último frame, crear uno negro
+                frame = np.zeros((default_shape[0], default_shape[1], 3), dtype=np.uint8)
+    else:
+        # No está en verde, usar último frame si existe
+        if last_frame is not None:
+            frame = last_frame.copy()
+        else:
+            # Intentar leer un frame si no hay buffer (inicio o error previo)
+            ret, frame = cap.read()
+            if ret:
+                read_success = True # Aunque no esté en verde, lo leímos ahora
+            else:
+                # No hay último frame y no se pudo leer, crear uno negro
+                frame = np.zeros((default_shape[0], default_shape[1], 3), dtype=np.uint8)
+                
+    return frame, read_success
+
+def draw_info(frame, semaforo_state, current_count, video_id):
+    """Dibuja el estado del semáforo y el conteo de autos en el frame."""
+    color = COLORS[semaforo_state]
+    
+    # Determinar color del texto basado en el estado del semáforo
+    if semaforo_state == "AMBAR":
+        text_color = (0, 0, 0)  # Negro para fondo Ámbar
+    else:
+        text_color = (255, 255, 255) # Blanco para fondo Verde o Rojo
+        
+    cv2.rectangle(frame, (0, 0), (frame.shape[1], 30), color, thickness=-1)
+    cv2.putText(frame, f"SEM: {semaforo_state}", (10, 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2) # Usar color de texto determinado
+    cv2.putText(frame, f"V{video_id}: {current_count} autos", (frame.shape[1] - 150, 20), # Ajustar posición
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2) # Usar color de texto determinado
+
+def detect_two_videos(path1, path2):
+    """Función principal que procesa dos videos y controla los semáforos."""
     cap1 = cv2.VideoCapture(path1)
     cap2 = cv2.VideoCapture(path2)
 
-    if not cap1.isOpened() or not cap2.isOpened():
-        print("video is corrupted or not found")
+    if not cap1.isOpened():
+        print(f"Error: No se pudo abrir el video {path1}")
+        if cap2.isOpened(): cap2.release()
         return
-    
-    # Crear ventana
-    cv2.namedWindow('Demo | Semáforos Inteligentes')
-    
+    if not cap2.isOpened():
+        print(f"Error: No se pudo abrir el video {path2}")
+        cap1.release()
+        return
+
+    # Obtener dimensiones del frame (intentar con el primero que funcione)
+    frame_h, frame_w = DEFAULT_FRAME_HEIGHT, DEFAULT_FRAME_WIDTH
+    ret1, f1_init = cap1.read()
+    if ret1:
+        frame_h, frame_w, _ = f1_init.shape
+        cap1.set(cv2.CAP_PROP_POS_FRAMES, 0) # Rebobinar
+    else:
+        ret2, f2_init = cap2.read()
+        if ret2:
+            frame_h, frame_w, _ = f2_init.shape
+            cap2.set(cv2.CAP_PROP_POS_FRAMES, 0) # Rebobinar
+        else:
+            print("Advertencia: No se pudo leer el primer frame de ninguno de los videos.")
+            print(f"Usando dimensiones por defecto: {frame_w}x{frame_h}")
+
+    default_shape = (frame_h, frame_w)
+
+    cv2.namedWindow('Comparación de videos', cv2.WINDOW_NORMAL) # Permitir redimensionar
+
     # Estado inicial para cada vía
     semaforo1 = {"estado": "VERDE", "inicio": time.time(), "duracion_verde": MIN_GREEN_TIME}
-    semaforo2 = {"estado": "ROJO", "inicio": time.time(), "duracion_verde": MIN_GREEN_TIME}  # Inicia en rojo
-    
-    # Buffers para guardar frames cuando el semáforo no está en verde
-    last_frame1 = None 
+    semaforo2 = {"estado": "ROJO", "inicio": time.time(), "duracion_verde": MIN_GREEN_TIME}
+
+    last_frame1 = None
     last_frame2 = None
-    
-    # Contadores de autos históricos para mejor ajuste
-    count1_hist = 0
-    count2_hist = 0
-    
+    count1_hist = 0.0
+    count2_hist = 0.0
+
     try:
         while True:
-            now = time.time()
-            
-            # --- VIDEO 1 ---
-            # Actualizar estado del semáforo
-            if semaforo1["estado"] == "VERDE" and now - semaforo1["inicio"] > semaforo1["duracion_verde"]:
-                # Cambia a ámbar
-                semaforo1["estado"] = "AMBAR"
-                semaforo1["inicio"] = now
-            elif semaforo1["estado"] == "AMBAR" and now - semaforo1["inicio"] > AMBER_TIME:
-                # Cambia a rojo
-                semaforo1["estado"] = "ROJO"
-                semaforo1["inicio"] = now
-            elif semaforo1["estado"] == "ROJO" and now - semaforo1["inicio"] > semaforo2["duracion_verde"] + AMBER_TIME:
-                # Cambia a verde y recalcula tiempo basado en el tráfico
-                semaforo1["estado"] = "VERDE"
-                semaforo1["inicio"] = now
-                # Ajustar duración verde según tráfico (proporción de autos)
-                total_count = count1_hist + count2_hist + EPS
-                proportion = count1_hist / total_count
-                # Duración verde mapeada entre MIN y MAX según la proporción de tráfico
-                semaforo1["duracion_verde"] = MIN_GREEN_TIME + (MAX_GREEN_TIME - MIN_GREEN_TIME) * proportion
-            
-            # Leer frame solo si está en verde
-            if semaforo1["estado"] == "VERDE":
-                ret1, f1 = cap1.read()
-                if ret1:
-                    # Guardar frame como último válido
-                    last_frame1 = f1.copy()
-                else:
-                    # Si no hay más frames y no hay guardados, crea negro
-                    if last_frame1 is None:
-                        f1 = np.zeros((480, 640, 3), dtype=np.uint8)
-                    else:
-                        f1 = last_frame1.copy()
-            else:
-                # En estados AMBAR o ROJO, mostrar último frame
-                if last_frame1 is None:
-                    # Primera ejecución o error de lectura
-                    ret1, f1 = cap1.read()
-                    if ret1:
-                        last_frame1 = f1.copy()
-                    else:
-                        f1 = np.zeros((480, 640, 3), dtype=np.uint8)
-                else:
-                    f1 = last_frame1.copy()
-            
-            # Procesar frame (detección de autos)
-            out1, count1 = process_frame(f1)
-            # Actualizar histórico de conteo con suavizado
-            count1_hist = 0.7 * count1_hist + 0.3 * count1  # Suavizado exponencial
-            
-            # --- VIDEO 2 ---
-            # Similar a video 1
-            if semaforo2["estado"] == "VERDE" and now - semaforo2["inicio"] > semaforo2["duracion_verde"]:
-                semaforo2["estado"] = "AMBAR"
-                semaforo2["inicio"] = now
-            elif semaforo2["estado"] == "AMBAR" and now - semaforo2["inicio"] > AMBER_TIME:
-                semaforo2["estado"] = "ROJO"
-                semaforo2["inicio"] = now
-            elif semaforo2["estado"] == "ROJO" and now - semaforo2["inicio"] > semaforo1["duracion_verde"] + AMBER_TIME:
-                semaforo2["estado"] = "VERDE"
-                semaforo2["inicio"] = now
-                # Ajustar según tráfico
-                total_count = count1_hist + count2_hist + EPS
-                proportion = count2_hist / total_count
-                semaforo2["duracion_verde"] = MIN_GREEN_TIME + (MAX_GREEN_TIME - MIN_GREEN_TIME) * proportion
-            
-            if semaforo2["estado"] == "VERDE":
-                ret2, f2 = cap2.read()
-                if ret2:
-                    last_frame2 = f2.copy()
-                else:
-                    if last_frame2 is None:
-                        f2 = np.zeros((480, 640, 3), dtype=np.uint8)
-                    else:
-                        f2 = last_frame2.copy()
-            else:
-                if last_frame2 is None:
-                    ret2, f2 = cap2.read()
-                    if ret2:
-                        last_frame2 = f2.copy()
-                    else:
-                        f2 = np.zeros((480, 640, 3), dtype=np.uint8)
-                else:
-                    f2 = last_frame2.copy()
-            
-            out2, count2 = process_frame(f2)
-            count2_hist = 0.7 * count2_hist + 0.3 * count2  # Suavizado exponencial
-            
-            # Asegurar que los frames tengan el mismo tamaño para evitar errores en hconcat
-            if out1.shape[0] != out2.shape[0] or out1.shape[1] != out2.shape[1]:
-                # Redimensionar para que tengan el mismo tamaño
-                target_height = max(out1.shape[0], out2.shape[0])
-                target_width = max(out1.shape[1], out2.shape[1])
-                if out1.shape[0] != target_height or out1.shape[1] != target_width:
-                    out1 = cv2.resize(out1, (target_width, target_height))
-                if out2.shape[0] != target_height or out2.shape[1] != target_width:
-                    out2 = cv2.resize(out2, (target_width, target_height))
-            
-            # Dibujar información del semáforo sobre los videos
-            # Semáforo 1
-            cv2.rectangle(out1, (0, 0), (out1.shape[1], 30), COLORS[semaforo1["estado"]], thickness=-1)
-            cv2.putText(out1, f"SEM: {semaforo1['estado']}", (10, 20), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
-            cv2.putText(out1, f"V1: {count1} autos", (200, 20), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
-            # Semáforo 2
-            cv2.rectangle(out2, (0, 0), (out2.shape[1], 30), COLORS[semaforo2["estado"]], thickness=-1)
-            cv2.putText(out2, f"SEM: {semaforo2['estado']}", (10, 20), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
-            cv2.putText(out2, f"V2: {count2} autos", (200, 20), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
-            
-            # Combinar videos
-            combined = cv2.hconcat([out1, out2])
-            
-            # Información general
-            info_text = f"V1: {count1} autos ({count1_hist:.1f})    V2: {count2} autos ({count2_hist:.1f})    Tiempos: {semaforo1['duracion_verde']:.1f}s / {semaforo2['duracion_verde']:.1f}s"
-            cv2.rectangle(combined, (0, combined.shape[0]-30), (combined.shape[1], combined.shape[0]), (0, 0, 0), thickness=-1)
-            cv2.putText(combined, info_text, (10, combined.shape[0]-10), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            
-            # Mostrar resultado
+            current_time = time.time()
+
+            # --- Actualizar Estados de Semáforos ---
+            # Se actualizan ambos antes de leer frames para asegurar consistencia
+            update_semaphore_state(current_time, semaforo1, semaforo2, count1_hist, count2_hist)
+            update_semaphore_state(current_time, semaforo2, semaforo1, count2_hist, count1_hist)
+
+            # --- Procesar Video 1 ---
+            frame1, read1_success = get_frame(cap1, last_frame1, semaforo1["estado"] == "VERDE", default_shape)
+            if read1_success: # Actualizar buffer solo si se leyó un nuevo frame
+                 last_frame1 = frame1.copy()
+            # Asegurar tamaño correcto antes de procesar
+            if frame1.shape[0] != frame_h or frame1.shape[1] != frame_w:
+                 frame1 = cv2.resize(frame1, (frame_w, frame_h))
+
+            processed_frame1, count1 = process_frame(frame1)
+            count1_hist = (1 - SMOOTHING_FACTOR) * count1_hist + SMOOTHING_FACTOR * count1
+            draw_info(processed_frame1, semaforo1["estado"], count1, 1)
+
+            # --- Procesar Video 2 ---
+            frame2, read2_success = get_frame(cap2, last_frame2, semaforo2["estado"] == "VERDE", default_shape)
+            if read2_success:
+                 last_frame2 = frame2.copy()
+            if frame2.shape[0] != frame_h or frame2.shape[1] != frame_w:
+                 frame2 = cv2.resize(frame2, (frame_w, frame_h))
+
+            processed_frame2, count2 = process_frame(frame2)
+            count2_hist = (1 - SMOOTHING_FACTOR) * count2_hist + SMOOTHING_FACTOR * count2
+            draw_info(processed_frame2, semaforo2["estado"], count2, 2)
+
+            # --- Combinar y Mostrar ---
+            # Asegurar que ambos frames procesados tengan exactamente el mismo tamaño final
+            if processed_frame1.shape != processed_frame2.shape:
+                 # Si el redimensionamiento anterior falló o process_frame cambió tamaño
+                 target_h = max(processed_frame1.shape[0], processed_frame2.shape[0])
+                 target_w = max(processed_frame1.shape[1], processed_frame2.shape[1])
+                 processed_frame1 = cv2.resize(processed_frame1, (target_w, target_h))
+                 processed_frame2 = cv2.resize(processed_frame2, (target_w, target_h))
+                 
+            combined = cv2.hconcat([processed_frame1, processed_frame2])
+
+            # Información general en la parte inferior
+            info_text = (f"V1: {count1} ({count1_hist:.1f}) T:{semaforo1['duracion_verde']:.1f}s | "
+                         f"V2: {count2} ({count2_hist:.1f}) T:{semaforo2['duracion_verde']:.1f}s")
+            info_bar_y = combined.shape[0]
+            cv2.rectangle(combined, (0, info_bar_y - 30), (combined.shape[1], info_bar_y), (0, 0, 0), thickness=-1)
+            cv2.putText(combined, info_text, (10, info_bar_y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2) # Texto blanco, grosor 2
+
             cv2.imshow('Comparación de videos', combined)
-            if cv2.waitKey(1) & 0xFF == 27:  # ESC para salir
-                print("saliendo...")
-                return
-        
+
+            if cv2.waitKey(1) & 0xFF == ESC_KEY:
+                print("Saliendo...")
+                break
+
     finally:
+        print("Liberando recursos...")
         cap1.release()
         cap2.release()
         cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    detect_two_videos(v1, v2)
+    detect_two_videos(V1_PATH, V2_PATH)
